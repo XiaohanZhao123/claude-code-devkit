@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+#
+# claude-pr-pipeline-up — bring up the PR review pipeline (Agent A + Agent B)
+# for the current git repo.
+#
+# Architecture:
+#
+#   ONE tmux session: <repo>-pr
+#     ├── window "review"        → /loop /pr-review-tick   (Agent A)
+#     └── window "orchestrator"  → /loop /pr-orch-tick     (Agent B,
+#                                  CLAUDE_ROLE=orchestrator)
+#
+#   Both windows run plain `claude` from PATH. Whatever backend `claude`
+#   is configured to talk to (Anthropic direct, AWS Bedrock, Vertex AI,
+#   a reverse proxy, etc.) is what the daemons use. This script is
+#   backend-agnostic.
+#
+#   The orchestrator window sets `CLAUDE_ROLE=orchestrator` in its env,
+#   which activates the `block-orchestrator-writes.sh` PreToolUse hook
+#   (from this kit). That hook gives the orchestrator a deterministic
+#   read-only contract — it can spawn worker sub-agents that do writes,
+#   but can't directly Edit/Write/commit/push itself.
+#
+# State lives at ~/.local/state/claude-pr-pipeline/<owner>__<repo>/.
+# A `dry_run` flag is created on first bring-up; Agent B respects it
+# until you `rm` it (typically after ~7 days of clean verdicts).
+#
+# Usage:
+#   claude-pr-pipeline-up [--only reviewer|fixer|both] [WORKTREE]
+#       --only         which daemon(s) to bring up (default: both)
+#       WORKTREE       defaults to $PWD if it's a git worktree
+#
+# Env overrides (rarely needed):
+#   PR_PIPELINE_EFFORT                reasoning effort level (default: xhigh)
+#                                     valid: low / medium / high / xhigh / max
+#   PR_PIPELINE_NO_DRY_RUN            skip creating the dry_run flag (DANGEROUS)
+#   PR_PIPELINE_REQUIRE_PERMISSIONS   drop --dangerously-skip-permissions
+#   CLAUDE_BIN                        override the `claude` binary path
+#                                     (default: `claude` from PATH)
+#   CODEX_PROFILE                     forwarded to the daemons via env so
+#                                     the pr-review-tick skill picks a
+#                                     specific codex profile. If unset,
+#                                     codex uses its default profile.
+#
+# Inspecting / tearing down:
+#   Attach (last-active window):  tmux attach -t <repo>-pr
+#   Attach to specific window:    tmux attach -t <repo>-pr:review
+#                                 tmux attach -t <repo>-pr:orchestrator
+#   Switch windows in tmux:       Ctrl-b n  (or 0/1 for window-by-index)
+#   Kill all:                     tmux kill-session -t <repo>-pr
+#   Kill one daemon:              tmux kill-window  -t <repo>-pr:review
+
+set -euo pipefail
+
+# --- arg parsing -------------------------------------------------------------
+
+ONLY="both"
+WORKTREE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --only)
+            ONLY="${2:-}"
+            shift 2 || { echo "[pr-pipeline-up] --only requires an argument" >&2; exit 1; }
+            ;;
+        --only=*)
+            ONLY="${1#*=}"
+            shift
+            ;;
+        -h|--help)
+            sed -n '1,40p' "$0" | sed 's/^# \?//'
+            exit 0
+            ;;
+        --)
+            shift
+            WORKTREE="${1:-}"
+            shift || true
+            ;;
+        *)
+            if [[ -z "$WORKTREE" ]]; then
+                WORKTREE="$1"
+                shift
+            else
+                echo "[pr-pipeline-up] unexpected arg: $1" >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+case "$ONLY" in
+    reviewer|fixer|both) ;;
+    *) echo "[pr-pipeline-up] --only must be reviewer|fixer|both, got: $ONLY" >&2; exit 1 ;;
+esac
+
+WORKTREE="${WORKTREE:-$PWD}"
+WORKTREE="$(cd "$WORKTREE" && pwd -P)"
+
+cd "$WORKTREE"
+
+# --- preflight ---------------------------------------------------------------
+
+err()  { printf '\033[31m[pr-pipeline-up] %s\033[0m\n' "$*" >&2; }
+info() { printf '\033[34m[pr-pipeline-up] %s\033[0m\n' "$*" >&2; }
+
+CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || true)}"
+if [[ -z "$CLAUDE_BIN" || ! -x "$CLAUDE_BIN" ]]; then
+    err "claude binary not found on PATH (and CLAUDE_BIN unset)"
+    err "  install Claude Code: https://docs.claude.com/claude-code"
+    exit 1
+fi
+
+# Required deps
+for bin in tmux flock gh codex git python3; do
+    command -v "$bin" >/dev/null 2>&1 || { err "missing dep: $bin"; exit 1; }
+done
+
+# jq is preferred but optional — skills will fall back to python3 -m json.tool
+if ! command -v jq >/dev/null 2>&1; then
+    info "jq not found on PATH — skills will fall back to python3"
+fi
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { err "$WORKTREE is not a git worktree"; exit 1; }
+gh auth status >/dev/null 2>&1 || { err "gh not authenticated; run 'gh auth login'"; exit 1; }
+
+# codex CLI must be installed; we don't pin a profile — the skill picks one
+# via CODEX_PROFILE env (or codex's default).
+if ! codex --version >/dev/null 2>&1; then
+    err "codex CLI not working (used by pr-review-tick skill + second-opinion-commit-gate hook)"
+    err "  install: see https://github.com/openai/codex"
+    exit 1
+fi
+if [[ -n "${CODEX_PROFILE:-}" ]]; then
+    codex --profile "$CODEX_PROFILE" --version >/dev/null 2>&1 \
+        || { err "CODEX_PROFILE=$CODEX_PROFILE is set but \`codex --profile $CODEX_PROFILE --version\` fails"; exit 1; }
+fi
+
+# Resolve repo identity
+SLUG=$(gh repo view --json owner,name -q '.owner.login + "__" + .name' 2>/dev/null || true)
+[[ -z "$SLUG" ]] && { err "could not resolve repo via 'gh repo view'; is the remote set?"; exit 1; }
+
+REPO_OWNER=$(gh repo view --json owner -q '.owner.login')
+REPO_NAME=$(gh repo view --json name -q '.name')
+
+# tmux dislikes ':' and '.' in session names — REPO_NAME is usually safe.
+SESSION="${REPO_NAME}-pr"
+WINDOW_REVIEW="review"
+WINDOW_ORCH="orchestrator"
+
+# --- state dir ---------------------------------------------------------------
+
+STATE_ROOT="$HOME/.local/state/claude-pr-pipeline/$SLUG"
+mkdir -p "$STATE_ROOT"
+
+if [[ -z "${PR_PIPELINE_NO_DRY_RUN:-}" ]]; then
+    if [[ ! -f "$STATE_ROOT/dry_run" ]]; then
+        date -Iseconds > "$STATE_ROOT/dry_run"
+        info "created dry-run flag at $STATE_ROOT/dry_run"
+        info "(Agent B will post 'would auto-merge' comments instead of merging until you 'rm' this file)"
+    fi
+fi
+
+# --- code-reviewer-opus must exist -------------------------------------------
+
+CLAUDE_AGENTS_DIR="${CLAUDE_HOME:-$HOME/.claude}/agents"
+if [[ ! -f "$CLAUDE_AGENTS_DIR/code-reviewer-opus.md" ]]; then
+    err "user-level Opus reviewer agent missing:"
+    err "  $CLAUDE_AGENTS_DIR/code-reviewer-opus.md"
+    err "  follow SETUP.md to install the devkit's agents/"
+    exit 1
+fi
+
+# --- detect existing session + windows ---------------------------------------
+
+SESSION_EXISTS=0
+REVIEW_EXISTS=0
+ORCH_EXISTS=0
+
+if tmux has-session -t "$SESSION" 2>/dev/null; then
+    SESSION_EXISTS=1
+    WINDOW_LIST=$(tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null || true)
+    grep -qx "$WINDOW_REVIEW" <<<"$WINDOW_LIST" && REVIEW_EXISTS=1
+    grep -qx "$WINDOW_ORCH"   <<<"$WINDOW_LIST" && ORCH_EXISTS=1
+    info "tmux session '$SESSION' exists  (review=$REVIEW_EXISTS, orchestrator=$ORCH_EXISTS)"
+fi
+
+# --- build commands ----------------------------------------------------------
+
+EFFORT="${PR_PIPELINE_EFFORT:-xhigh}"
+
+CLAUDE_REVIEW_CMD=("$CLAUDE_BIN")
+CLAUDE_ORCH_CMD=("$CLAUDE_BIN")
+
+# Reasoning effort — explicit so it's visible in argv. Both daemons need
+# careful judgement (review triage, worker triage, verdict gate), so xhigh
+# is the right default. settings.json effortLevel would also default to
+# xhigh, but we set it on the command line so it's not silently changed by
+# editing settings.json.
+CLAUDE_REVIEW_CMD+=(--effort "$EFFORT")
+CLAUDE_ORCH_CMD+=(--effort "$EFFORT")
+
+# Permission mode — bypass prompts so detached tmux doesn't hang.
+#
+# IMPORTANT: --dangerously-skip-permissions ALONE is not enough when
+# settings.json has `permissions.defaultMode: acceptEdits`, because the
+# CLI flag enables bypass-permissions mode as an *option* but doesn't
+# override the active mode. The daemon hits a permission prompt the moment
+# it tries a destructive Bash compound command (e.g., orchestrator's
+# worktree-cleanup `git branch -D ... ; rm -rf ...`).
+#
+# Fix: pass --permission-mode bypassPermissions EXPLICITLY. That sets
+# the active mode for the session and overrides settings.json's
+# defaultMode. Keep --dangerously-skip-permissions too as the "yes I
+# really mean it" signal that lets bypass mode be available at all.
+#
+# Hooks (block-uv-pip / protect-paths / second-opinion-commit-gate /
+# block-orchestrator-writes for the orch window) still fire regardless
+# of permission mode — they're a separate enforcement layer.
+if [[ -z "${PR_PIPELINE_REQUIRE_PERMISSIONS:-}" ]]; then
+    CLAUDE_REVIEW_CMD+=(--dangerously-skip-permissions --permission-mode bypassPermissions)
+    CLAUDE_ORCH_CMD+=(--dangerously-skip-permissions --permission-mode bypassPermissions)
+fi
+
+# Initial prompt — /loop dynamic mode (no interval; model self-paces).
+CLAUDE_REVIEW_CMD+=("/loop /pr-review-tick")
+CLAUDE_ORCH_CMD+=("/loop /pr-orch-tick")
+
+# --- spawn helpers -----------------------------------------------------------
+
+# Forward CODEX_PROFILE to daemon panes if set in this shell's env (so the
+# pr-review-tick skill picks the right profile when invoking codex).
+CODEX_ENV_PREFIX=""
+if [[ -n "${CODEX_PROFILE:-}" ]]; then
+    CODEX_ENV_PREFIX="env CODEX_PROFILE=$(printf '%q' "$CODEX_PROFILE") "
+fi
+
+# Each spawn either creates the session-with-its-first-window, or adds a
+# window to an existing session. Both end up at the same final state.
+#
+# Note on quoting: `${CMD[*]@Q}` (single string) — not `${CMD[@]@Q}`
+# (multiple words). tmux runs its arg through the shell as ONE string, and
+# the multi-word form silently drops args.
+spawn_review() {
+    if [[ "$SESSION_EXISTS" == "0" ]]; then
+        info "creating tmux session '$SESSION', first window '$WINDOW_REVIEW'"
+        tmux new-session -d -s "$SESSION" -n "$WINDOW_REVIEW" -c "$WORKTREE" \
+            "${CODEX_ENV_PREFIX}${CLAUDE_REVIEW_CMD[*]@Q}"
+        SESSION_EXISTS=1
+    else
+        info "adding window '$WINDOW_REVIEW' to existing session '$SESSION'"
+        tmux new-window -t "$SESSION:" -n "$WINDOW_REVIEW" -c "$WORKTREE" \
+            "${CODEX_ENV_PREFIX}${CLAUDE_REVIEW_CMD[*]@Q}"
+    fi
+    REVIEW_EXISTS=1
+}
+
+spawn_orch() {
+    # CLAUDE_ROLE=orchestrator activates ~/.claude/hooks/block-orchestrator-writes.sh
+    # which deterministically blocks Edit/Write and code-mutating Bash patterns
+    # in the orchestrator's session.
+    #
+    # `env CLAUDE_ROLE=orchestrator <cmd>` prefix (not tmux's `-e VAR=VAL` flag)
+    # for tmux 3.0+ compatibility. tmux runs the command through the user's
+    # shell, which interprets `env VAR=VAL cmd` as "set VAR and exec cmd".
+    if [[ "$SESSION_EXISTS" == "0" ]]; then
+        info "creating tmux session '$SESSION', first window '$WINDOW_ORCH' (CLAUDE_ROLE=orchestrator)"
+        tmux new-session -d -s "$SESSION" -n "$WINDOW_ORCH" -c "$WORKTREE" \
+            "env CLAUDE_ROLE=orchestrator ${CODEX_ENV_PREFIX}${CLAUDE_ORCH_CMD[*]@Q}"
+        SESSION_EXISTS=1
+    else
+        info "adding window '$WINDOW_ORCH' to existing session '$SESSION' (CLAUDE_ROLE=orchestrator)"
+        tmux new-window -t "$SESSION:" -n "$WINDOW_ORCH" -c "$WORKTREE" \
+            "env CLAUDE_ROLE=orchestrator ${CODEX_ENV_PREFIX}${CLAUDE_ORCH_CMD[*]@Q}"
+    fi
+    ORCH_EXISTS=1
+}
+
+# Spawn order: review first when --only=both so it gets window index 0.
+if [[ "$ONLY" == "reviewer" || "$ONLY" == "both" ]]; then
+    if [[ "$REVIEW_EXISTS" == "0" ]]; then
+        spawn_review
+    else
+        info "window '$WINDOW_REVIEW' already exists in '$SESSION'; not respawning"
+    fi
+fi
+if [[ "$ONLY" == "fixer" || "$ONLY" == "both" ]]; then
+    if [[ "$ORCH_EXISTS" == "0" ]]; then
+        spawn_orch
+    else
+        info "window '$WINDOW_ORCH' already exists in '$SESSION'; not respawning"
+    fi
+fi
+
+# --- post-spawn assertions --------------------------------------------------
+
+sleep 2
+
+DEAD=()
+ORCH_PID=""
+
+# Liveness: each requested window must still exist after 2s.
+if [[ "$ONLY" == "reviewer" || "$ONLY" == "both" ]]; then
+    if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_REVIEW"; then
+        DEAD+=("$SESSION:$WINDOW_REVIEW")
+    fi
+fi
+if [[ "$ONLY" == "fixer" || "$ONLY" == "both" ]]; then
+    if ! tmux list-windows -t "$SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$WINDOW_ORCH"; then
+        DEAD+=("$SESSION:$WINDOW_ORCH")
+    else
+        # Anchor via tmux pane PID, then walk descendants to find `claude`.
+        # Avoids `pgrep -f` false-positives from unrelated shells.
+        PANE_PID=$(tmux list-panes -t "$SESSION:$WINDOW_ORCH" -F '#{pane_pid}' 2>/dev/null | head -1 || true)
+        if [[ -n "$PANE_PID" ]]; then
+            for cand in "$PANE_PID" \
+                    $(pgrep -P "$PANE_PID" 2>/dev/null) \
+                    $(pgrep -P "$PANE_PID" 2>/dev/null | xargs -r -I{} pgrep -P {} 2>/dev/null); do
+                [[ -z "$cand" ]] && continue
+                if [[ "$(ps -o comm= -p "$cand" 2>/dev/null | tr -d ' ')" == "claude" ]]; then
+                    ORCH_PID="$cand"
+                    break
+                fi
+            done
+        fi
+    fi
+fi
+
+if [[ ${#DEAD[@]} -gt 0 ]]; then
+    err "post-spawn check: window(s) died within 2s of spawn: ${DEAD[*]}"
+    err "  Common causes: claude exited (auth lapse, plugin error, etc.),"
+    err "  or your backend / proxy is unreachable."
+    err "  Diagnose: tmux attach -t $SESSION   # then Ctrl-b N to switch windows"
+    exit 1
+fi
+
+# Verify CLAUDE_ROLE=orchestrator made it into the orchestrator's claude env.
+# Without this, the read-only hook (block-orchestrator-writes.sh) doesn't fire.
+if [[ -n "$ORCH_PID" ]] && [[ -r "/proc/$ORCH_PID/environ" ]]; then
+    if ! tr '\0' '\n' < "/proc/$ORCH_PID/environ" | grep -q '^CLAUDE_ROLE=orchestrator$'; then
+        err "orchestrator window's claude (PID $ORCH_PID) is alive but"
+        err "  CLAUDE_ROLE=orchestrator is NOT in its env. Read-only hook will not fire."
+        err "  Killing the window to prevent unsafe operation. ABORTING."
+        err ""
+        err "  Diagnose: cat /proc/$ORCH_PID/environ | tr '\\\\0' '\\\\n' | grep CLAUDE"
+        tmux kill-window -t "$SESSION:$WINDOW_ORCH" 2>/dev/null || true
+        exit 1
+    fi
+elif [[ "$ONLY" == "fixer" || "$ONLY" == "both" ]] && [[ -z "$ORCH_PID" ]]; then
+    info "warning: could not pgrep claude for orchestrator window — env unverified."
+    info "  Verify by hand: tmux attach -t $SESSION:$WINDOW_ORCH; then ! echo \$CLAUDE_ROLE"
+fi
+
+# --- summary ----------------------------------------------------------------
+
+WINDOW_LINES=""
+if [[ "$ONLY" == "reviewer" || "$ONLY" == "both" ]]; then
+    WINDOW_LINES+="  $SESSION:$WINDOW_REVIEW       (Agent A, /loop /pr-review-tick)"$'\n'
+fi
+if [[ "$ONLY" == "fixer" || "$ONLY" == "both" ]]; then
+    WINDOW_LINES+="  $SESSION:$WINDOW_ORCH (Agent B, /loop /pr-orch-tick, CLAUDE_ROLE=orchestrator)"$'\n'
+fi
+
+cat <<EOF
+
+PR review pipeline up for ${REPO_OWNER}/${REPO_NAME}  (mode: --only $ONLY)
+============================================================
+
+Backend:         claude=$CLAUDE_BIN  codex=$(command -v codex)${CODEX_PROFILE:+ (--profile $CODEX_PROFILE)}
+Worktree:        $WORKTREE
+State:           $STATE_ROOT
+Dry-run:         $([[ -f "$STATE_ROOT/dry_run" ]] && echo "ON (created $(cat "$STATE_ROOT/dry_run"))" || echo "OFF — Agent B will perform real merges")
+Permissions:     $([[ -z "${PR_PIPELINE_REQUIRE_PERMISSIONS:-}" ]] && echo "BYPASSED (--dangerously-skip-permissions; hooks still fire)" || echo "ENFORCED")
+
+Session: $SESSION
+Windows:
+$WINDOW_LINES
+Control:
+  Attach:        tmux attach -t $SESSION                   # last-active window
+                 tmux attach -t $SESSION:$WINDOW_REVIEW     # focus reviewer
+                 tmux attach -t $SESSION:$WINDOW_ORCH       # focus orchestrator
+  Switch:        Ctrl-b n  (next window)  /  Ctrl-b 0|1  (by index)
+  Detach:        Ctrl-b d
+  Kill all:      tmux kill-session -t $SESSION
+  Kill one:      tmux kill-window  -t $SESSION:$WINDOW_REVIEW
+                 tmux kill-window  -t $SESSION:$WINDOW_ORCH
+
+After ~7 days of clean dry-run verdicts, flip to real-merge mode:
+                 rm $STATE_ROOT/dry_run
+
+EOF
