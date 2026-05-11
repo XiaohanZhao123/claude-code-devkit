@@ -1,141 +1,199 @@
 # claude-code-devkit
 
-A set of Claude Code [hooks][hooks], [skills][skills], and [agents][agents]
-that the maintainer uses day-to-day, packaged for sharing. Backend-agnostic
-— works with whatever Claude Code is configured to talk to (Anthropic
-direct, AWS Bedrock, Vertex AI, a reverse proxy, etc.).
+A small set of [Claude Code][cc] hooks, skills, and an autonomous PR
+review/fix daemon pipeline. Backend-agnostic — works with whatever
+Claude Code is configured to talk to (Anthropic direct, AWS Bedrock,
+Vertex AI, etc.).
 
-The two highest-value pieces:
+Two pieces do most of the work:
 
-1. **An autonomous PR review/fix pipeline.** Two long-running `claude` daemons per
-   repo, tmux-managed, on a 2-minute cron tick. Agent A reviews any open
-   PR with new content (three independent angles); Agent B picks up Agent A's
-   findings, spawns a worker sub-agent inside a `git worktree`, fixes the
-   real issues, commits with `[auto N/4]` tags, and either auto-merges (after a
-   dry-run period) or pings the operator. Pushes 5-10+ auto-fix commits per
-   PR until findings clear or the round-cap hits. See
-   [docs/architecture.md](docs/architecture.md) for the full design.
+- A **two-daemon PR pipeline** (one tmux session per repo). Agent A
+  reviews open PRs from three independent angles and posts a single
+  aggregated comment. Agent B reads that comment, spawns a worker
+  in an isolated worktree, fixes the real findings, and either
+  auto-merges or pings you.
+- A **pre-commit second-opinion gate**. A `PreToolUse` hook runs
+  `codex review` on every staged commit. On any `[P0]` finding it
+  blocks the commit and shows the review to Claude, which has to
+  address it (or `[skip-review]` with a reason) before retrying.
 
-2. **A pre-commit second-opinion gate.** A `PreToolUse` hook runs
-   `codex review` on every staged commit (any non-Claude reviewer model
-   you've configured for `codex` works — Azure OpenAI, OpenAI direct, GitHub
-   Copilot Enterprise via a reverse proxy, etc). On any `[P0]` finding the
-   hook blocks the commit and shows the review to Claude, which has to
-   address it (or `[skip-review]` with documented reasoning) before retrying.
-   Plus a `commit-defense-loop` skill for systematically working through the
-   findings.
+[cc]: https://docs.claude.com/en/docs/claude-code
 
-[hooks]: https://docs.claude.com/en/docs/claude-code/hooks
-[skills]: https://docs.claude.com/en/docs/claude-code/skills
-[agents]: https://docs.claude.com/en/docs/claude-code/sub-agents
+## Demo: a blocked commit
 
-## What's inside
+When Claude tries to land a commit with a real `[P0]` finding, this is
+what it sees (and what stops the commit):
 
 ```
-claude-code-devkit/
-├── hooks/                  PreToolUse + SessionStart hooks
-│   ├── block-uv-pip.sh                Stop `uv pip install` → force `uv add`
-│   ├── block-orchestrator-writes.sh   Read-only contract for orchestrator daemons
-│   ├── protect-paths.sh               Guard sensitive paths from Edit/Write
-│   ├── protect-state-from-rm.sh       Guard pipeline state from `rm -rf`
-│   ├── session-start-git-context.sh   Inject git state into session start
-│   └── second-opinion-commit-gate.sh  `codex review` on every commit
-├── skills/                 Slash-commands / workflow recipes
-│   ├── pr-review-tick/      Agent A — one PR review cycle
-│   ├── pr-orch-tick/        Agent B — one PR orchestration cycle
-│   ├── pr-defense-loop/     Defend a PR against review bots
-│   ├── commit-defense-loop/ Defend a commit against the gate hook
-│   └── commit-quality-pipe/ Three-stage commit quality pipeline
-├── agents/
-│   └── code-reviewer-opus.md   User-level Opus reviewer subagent
-├── bin/
-│   └── claude-pr-pipeline-up   Bring up the PR daemons for the current repo
-├── statusline.py           Compact statusline (model | branch | ctx tokens)
-├── settings.example.json         Interactive-session settings (allow/ask/hooks/statusline)
-├── settings.daemon.example.json  Daemon-session settings (bypassPermissions)
-├── SETUP.md                Installation guide (feed to Claude Code)
-└── docs/
-    └── architecture.md     PR pipeline design + Agent A/B contract
+=== second-opinion BLOCKING (P0 found; address or add [skip-review] to retry) ===
+
+Review of staged diff (94 lines, 3 files):
+
+- [P0] src/auth/session.py:47 — token comparison uses `==` instead of
+  `hmac.compare_digest`; vulnerable to timing oracle. The new code path
+  is reached on every login.
+
+- [P1] src/auth/session.py:52 — missing test for the rotated-token
+  branch added in this commit.
+
+=== suppress: [skip-review] in msg, SKIP_SECOND_OPINION=1, or SECOND_OPINION_ADVISORY=1 ===
 ```
+
+`commit-defense-loop` (one of the included skills) is the tool for working
+through findings like that — triage, fix, retest, retry — rather than
+reflex-`[skip-review]`-ing them.
 
 ## Install
 
-The fastest path: **open Claude Code in this repo and ask it to follow [SETUP.md](SETUP.md)**.
-It will copy the hooks/skills/agents into `~/.claude/`, merge `settings.example.json` into
-your existing `~/.claude/settings.json` (or seed one), and verify the prerequisites.
+The fast path: open Claude Code in a checkout of this repo and ask it
+to follow [`SETUP.md`](SETUP.md). The guide is written for Claude to
+execute — it'll copy hooks/skills/agents into `~/.claude/`, merge
+`settings.example.json` into your existing `~/.claude/settings.json`,
+and verify prerequisites.
 
-If you'd rather install by hand: read `SETUP.md`. The steps are short.
+By hand: same steps, written out in `SETUP.md`. ~10 minutes.
 
-## Requirements
+Requirements:
 
-- [Claude Code][claude-code] CLI installed and on PATH (`claude --version` works).
-- `gh` CLI authenticated (for the PR pipeline).
-- `tmux` and `flock` (for the PR pipeline daemons).
-- `codex` CLI with at least one working profile (for the second-opinion
-  commit hook + `pr-review-tick` cross-vendor adversarial review). The
-  profile can point at Azure OpenAI, OpenAI direct, GitHub Copilot
-  Enterprise via reverse proxy, etc. — this kit doesn't care which.
-- `jq` (optional but preferred; skills fall back to `python3 -m json.tool`).
+- [Claude Code][cc] CLI (`claude --version` works).
+- `gh`, `tmux`, `flock` for the PR pipeline.
+- `codex` CLI with any working profile (Azure OpenAI, OpenAI direct,
+  GitHub Copilot Enterprise via reverse proxy — the kit doesn't care
+  which) for the commit gate + cross-vendor PR review angle.
 
-[claude-code]: https://docs.claude.com/en/docs/claude-code
+## Quickstart — PR pipeline
 
-## Quickstart — the PR pipeline
-
-After install, from inside any git worktree with a GitHub remote:
+From any git worktree with a GitHub remote:
 
 ```bash
-cd /path/to/your/repo
 claude-pr-pipeline-up --only both
 ```
 
-That starts one tmux session `<repo>-pr` with two windows (`review` +
-`orchestrator`). Both run `claude` on a `/loop` schedule. State lives at
-`~/.local/state/claude-pr-pipeline/<owner>__<repo>/`. A `dry_run` flag is
-created on first bring-up — Agent B will post "would auto-merge" comments
-instead of actually merging until you `rm` the flag (typically after a
-week of clean verdicts).
-
-To watch:
+That brings up one tmux session `<repo>-pr` with two windows. State
+lives at `~/.local/state/claude-pr-pipeline/<owner>__<repo>/`. A
+`dry_run` flag is created on first bring-up; Agent B posts "would
+auto-merge" comments instead of actually merging until you `rm` the
+flag (typically after a week of clean verdicts).
 
 ```bash
 tmux attach -t <repo>-pr           # last-active window
 tmux attach -t <repo>-pr:review    # Agent A
 tmux attach -t <repo>-pr:orchestrator  # Agent B
 # Ctrl-b d to detach
+tmux kill-session -t <repo>-pr     # stop the daemons
 ```
 
-To stop:
+## What's in the kit
 
-```bash
-tmux kill-session -t <repo>-pr
+| Category | Count | Summary |
+|---|---:|---|
+| [Hooks](#hooks) | 6 | PreToolUse / SessionStart guards |
+| [Skills](#skills) | 5 | Slash-command workflows |
+| [Agent](#agent) | 1 | User-level Opus reviewer sub-agent |
+| [Launcher](#agent) | 1 | `bin/claude-pr-pipeline-up` |
+| Settings templates | 2 | `settings.example.json` (interactive) + `settings.daemon.example.json` (bypass-permissions for daemons) |
+| Statusline | 1 | `<model> \| <branch> \| ctx <tokens>` |
+| Docs | 3 | README, SETUP, `docs/architecture.md` |
+
+<a id="hooks"></a>
+<details>
+<summary><strong>Hooks (6)</strong> — click to expand</summary>
+
+| File | Matcher | What it does |
+|---|---|---|
+| `block-uv-pip.sh` | PreToolUse / Bash | Blocks `uv pip install` / `uv pip uninstall`; forces `uv add` / `uv remove` for `pyproject.toml` + `uv.lock` reproducibility |
+| `block-orchestrator-writes.sh` | PreToolUse / Bash + Edit/Write | Active only when `CLAUDE_ROLE=orchestrator` is set. Deterministically blocks code-mutating ops (Edit/Write, `git commit`/`push`/`rebase`, `sed -i`, `perl -i`). Bypasses when the call comes from a sub-agent (payload has `agent_id`) so workers can still write. |
+| `protect-paths.sh` | PreToolUse / Edit/Write/NotebookEdit | Blocks writes to sensitive paths: `.env*`, `.git/`, `~/.ssh/`, `/etc/`, lockfiles, `.venv/`, etc. |
+| `protect-state-from-rm.sh` | PreToolUse / Bash | Blocks `rm -rf` targeting PR pipeline state dirs, `~/.claude/`, bare `~`/`$HOME`/`/tmp`, bare `.` or `/`. Worker worktree paths under `/tmp/orch-*` go through an allowlist. |
+| `session-start-git-context.sh` | SessionStart | Injects current branch, tracking state, uncommitted changes, recent commits, and worktree list into session start so Claude has working-tree context without asking |
+| `second-opinion-commit-gate.sh` | PreToolUse / Bash (only `git commit`) | Runs `codex review --uncommitted` on every commit. Exit 2 on `[P0]` (blocks + shows to model). Skip rules: `[skip-review]` in msg, `SKIP_SECOND_OPINION=1`, WIP branch, `.md`/`.lock`-only diff, diff > 5000 lines, rebase in flight. Profile via `CODEX_PROFILE` env. |
+
+</details>
+
+<a id="skills"></a>
+<details>
+<summary><strong>Skills (5)</strong> — click to expand</summary>
+
+| Skill | Trigger | What it does |
+|---|---|---|
+| `pr-review-tick` | `/loop /pr-review-tick`, "Agent A" | One review cycle. Three parallel angles: codex cross-vendor adversarial, code-reviewer-opus, bespoke Opus PR-coherence pass. Posts ONE aggregated comment per (PR, head-sha). For PRs > 5000 lines, first-fit-decreasing bin-packs the diff into synthetic commits and reviews each. |
+| `pr-orch-tick` | `/loop /pr-orch-tick`, "Agent B" | One orchestration cycle. Reads Agent A's findings → spawns worker in `/tmp/orch-<slug>-pr<N>` → worker triages a/b/c, fixes the a's, commits with `[auto N/4]`, pushes. Verdict gate: dry-run comment / real `gh pr merge` / @-escalate. Caps at `max_rounds=4`. |
+| `pr-defense-loop` | "run a defense loop", "fix all the bot comments" | Defends a PR against external review bots by polling for new comments, triaging, fixing, pushing, looping. Survives multi-bot setups. |
+| `commit-defense-loop` | "the commit got blocked", `=== second-opinion BLOCKING ===` in stderr | Defends a `git commit` against the second-opinion gate hook. Triage → fix with regression test → retry. Single turn, no `/tmp` state, no `ScheduleWakeup` (tighter than `pr-defense-loop` because each iter is 60s of hook latency, not minutes). |
+| `commit-quality-pipe` | "ship this commit", "audit those commits" | Three-stage pre-commit pipeline: Claude Opus multi-angle review → `simplify` reuse/quality pass → codex review as final gate. Mode A pre-commit, Mode B retroactive audit on already-landed commits. |
+
+</details>
+
+<a id="agent"></a>
+<details>
+<summary><strong>Agent + launcher + configs</strong> — click to expand</summary>
+
+| File | Purpose |
+|---|---|
+| `agents/code-reviewer-opus.md` | User-level Opus reviewer sub-agent. Confidence ≥ 80 filter, repo-agnostic, reused by `commit-quality-pipe` phase 1 and `pr-review-tick` angle 2. |
+| `bin/claude-pr-pipeline-up` | Brings up the PR pipeline tmux session for the current repo. Preflight (gh/tmux/codex/etc.), creates `dry_run` safety flag on first run, two windows (review + orchestrator), orchestrator gets `CLAUDE_ROLE=orchestrator` injected. |
+| `settings.example.json` | Template `~/.claude/settings.json` for interactive sessions: `permissions.allow` / `permissions.ask` lists, hook registrations, statusline, `effortLevel: xhigh` |
+| `settings.daemon.example.json` | Variant for background daemon sessions: `defaultMode: bypassPermissions`, no `ask` prompts (hooks still gate, just no interactive prompts) |
+| `statusline.py` | `<model> \| <branch> \| ctx <tokens>` statusline. Reads transcript jsonl for the latest `usage` to compute context size. |
+
+</details>
+
+## How the pipeline works
+
+One tmux session per repo, two long-running Claude sessions inside.
+Agent A reviews; Agent B fixes. They coordinate via on-disk state and
+GitHub PR comments — no direct IPC.
+
+```
+        GitHub repo (open PRs)
+                  │
+                  ▼
+   ┌──────────────────────────────────────────────┐
+   │  tmux: <repo>-pr                             │
+   │  ┌────────────────┐  ┌──────────────────┐    │
+   │  │ window "review"│  │ window "orch"    │    │
+   │  │ /pr-review-tick│  │ /pr-orch-tick    │    │
+   │  │ Agent A        │  │ Agent B          │    │
+   │  │                │  │ CLAUDE_ROLE=orch │    │
+   │  └────────┬───────┘  └─────────┬────────┘    │
+   └───────────┼────────────────────┼─────────────┘
+               │                    │
+               ▼                    ▼
+        PR comment          /tmp/orch-<slug>-pr<N>/
+       (Agent A round       (worker worktree;
+        @ <short-sha>)       sub-agent fixes,
+                             commits [auto N/4],
+                             pushes back to PR branch)
+                                    │
+                                    ▼
+                            PR head moves → next
+                            review round triggers
 ```
 
-## Quickstart — the commit gate
+The orchestrator (Agent B) is **read-only with respect to code**. Only
+its worker sub-agent writes / commits / pushes. This is enforced by
+`block-orchestrator-writes.sh`, not by trust — see the design doc for
+why that distinction matters.
 
-Once `hooks/second-opinion-commit-gate.sh` is registered in
-`~/.claude/settings.json` (`SETUP.md` does this), every `git commit` Claude
-runs goes through `codex review --uncommitted` first. On any `[P0]` finding
-the hook blocks the commit and shows the review to Claude.
+**Full design**: [`docs/architecture.md`](docs/architecture.md).
 
-When you want Claude to systematically work through the findings rather
-than reflex-`[skip-review]` them, invoke the `commit-defense-loop` skill:
+## Design notes
 
-```
-> the commit got blocked, work through the findings
-```
+The hooks here are deterministic — they enforce contracts the model
+genuinely can forget under load (the orchestrator shouldn't write
+code; sub-agents shouldn't `rm -rf` pipeline state; `uv pip install`
+is always wrong in a `uv add` project). They're not reminders; they
+exit 2 and block.
 
-(That trigger phrase auto-loads the skill — Claude reads its `SKILL.md`
-and follows the triage protocol.)
+The skills are model-driven — they give Claude a structured triage
+protocol and trust the model's judgment within it. `pr-defense-loop`
+doesn't tell Claude which findings are wrong; it tells Claude *how* to
+decide.
 
-## A note on philosophy
-
-The hooks here are deliberately **deterministic** — they enforce contracts
-the model genuinely can forget under load (the orchestrator daemon
-shouldn't write code; sub-agents shouldn't `rm -rf` pipeline state;
-`uv pip install` is always wrong in a `uv add` project). They're not
-"reminders"; they exit 2 and block. The skills are deliberately
-**model-driven** — they give Claude a structured triage protocol and trust
-the model's judgment within it. Different tools for different problems.
+What this kit deliberately does NOT do: prescribe a backend, run
+systemd services, set up reverse proxies, or merge PRs from external
+contributors without a human in the loop. Those are deployment /
+policy choices, kept out of the kit on purpose.
 
 ## License
 
