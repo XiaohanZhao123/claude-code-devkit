@@ -1,6 +1,6 @@
 ---
 name: pr-review-tick
-description: One review cycle of the PR review pipeline (Agent A). Designed to be invoked by `/loop /pr-review-tick` inside a long-running tmux daemon session, one per repo. Each tick discovers open PRs, dedups against the (pr_number, head_sha) → review_id map in `~/.local/state/claude-pr-pipeline/<repo>/`, and for each PR with new content runs a three-angle review — (1) codex GPT-5.5 cross-vendor adversarial, (2) `code-reviewer-opus` user-level Opus reviewer (CLAUDE.md mandated), (3) bespoke Opus PR-coherence pass covering cross-commit / scope / test-completeness / CI / arch-fit / breaking-change angles the per-commit hook can't see — then aggregates findings, posts ONE PR comment, and re-arms via ScheduleWakeup. Sibling skill is `pr-orch-tick` (Agent B, fix + verdict). Use this whenever the user says "start the review daemon", "kick off the PR review tick", "Agent A", or `/loop /pr-review-tick`. NEVER fixes code. NEVER pushes commits. NEVER merges. Read-only against the repo; only writes are PR comments and the local state directory. Deliberately avoids `pr-review-toolkit` (Anthropic-internal-poisoned prompts) and `code-review:code-review` (5× Sonnet, downgrade vs. Opus on Max).
+description: One review cycle of the PR review pipeline (Agent A). Designed to be invoked by `/loop /pr-review-tick` inside a long-running tmux daemon session, one per repo. Each tick discovers open PRs that have explicitly opted into the pipeline (via the `[auto PR loop]` marker in title or body), dedups against the (pr_number, head_sha) → review_id map in `~/.local/state/claude-pr-pipeline/<repo>/`, and for each opted-in PR with new content runs a three-angle review — (1) codex GPT-5.5 cross-vendor adversarial, (2) `code-reviewer-opus` user-level Opus reviewer (CLAUDE.md mandated), (3) bespoke Opus PR-coherence pass covering cross-commit / scope / test-completeness / CI / arch-fit / breaking-change angles the per-commit hook can't see — then aggregates findings, posts ONE PR comment, and re-arms via ScheduleWakeup. Sibling skill is `pr-orch-tick` (Agent B, fix + verdict). Use this whenever the user says "start the review daemon", "kick off the PR review tick", "Agent A", or `/loop /pr-review-tick`. NEVER fixes code. NEVER pushes commits. NEVER merges. Read-only against the repo; only writes are PR comments and the local state directory. Deliberately avoids `pr-review-toolkit` (Anthropic-internal-poisoned prompts) and `code-review:code-review` (5× Sonnet, downgrade vs. Opus on Max).
 ---
 
 # PR review tick — Agent A of the PR review pipeline
@@ -156,11 +156,57 @@ If failed, fix it now before going to step 2.
 ### 2. Discover work
 
 ```bash
-gh pr list --state open --json number,headRefOid,headRefName,author,authorAssociation,isDraft \
+gh pr list --state open --json number,title,body,headRefOid,headRefName,author,authorAssociation,isDraft \
   -q '.[] | select(.isDraft == false)'
 ```
 
 Skip drafts. Skip PRs whose `headRefOid == last_reviewed_sha` in state.
+
+#### 2a. Opt-in keyword filter — `[auto PR loop]` (MANDATORY)
+
+> **The pipeline only touches PRs the author has explicitly opted in.**
+> A PR is opted in if and only if its **title** OR the **first 500
+> characters of its body** contain the case-insensitive marker
+> `[auto PR loop]` (with brackets, any internal whitespace OK).
+> Any PR without the marker MUST be skipped, even if Agent A has
+> reviewed it in a previous tick.
+
+Rationale: the opt-in marker is the explicit handshake from the human
+author. It says: "this PR is in a clean enough state that I want
+Agent A + Agent B to drive it to convergence; you have permission to
+push `[auto N/4]` commits to the branch." Without that handshake, we
+can't know whether the branch is being concurrently worked elsewhere,
+whether the author is mid-rebase, whether the PR title/scope reflects
+the actual diff, etc. Better to do nothing than to interfere.
+
+```python
+import re
+OPT_IN_RE = re.compile(r"\[\s*auto\s+PR\s+loop\s*\]", re.IGNORECASE)
+
+def is_opted_in(pr):
+    """True iff `[auto PR loop]` appears in PR title OR body[:500]."""
+    title = pr.get("title", "") or ""
+    body  = (pr.get("body", "") or "")[:500]
+    return bool(OPT_IN_RE.search(title) or OPT_IN_RE.search(body))
+
+opted_in = [pr for pr in prs if is_opted_in(pr)]
+```
+
+If `opted_in` is empty: log how many open PRs were skipped (so daemons
+remain observable in the pane) and re-arm. No review work this tick.
+
+```python
+if not opted_in:
+    print(f"Tick: {len(prs)} open PR(s); 0 opted-in (no '[auto PR loop]' marker). Idle.")
+    # re-arm and exit
+```
+
+**The marker is also the off switch.** If a previously opted-in PR
+has its marker removed (author edited the title/body), this tick
+will silently drop it from the opt-in set — Agent A stops reviewing
+new commits on it, and Agent B's sibling skill will stop fixing.
+
+Continue per-PR processing only with `opted_in`.
 
 For each remaining PR:
 - Pull `gh pr diff --name-only <N>` and apply the **docs-only fast path**:
@@ -171,7 +217,7 @@ For each remaining PR:
 
   | Reviewer | Cap (additions+deletions) | Why |
   |---|---|---|
-  | Codex (gpt-5.5 or similar via configured profile) | 5000 PER CALL, 50000 PR total via per-commit chunking | Empirically codex degrades sharply >5000 lines/call (10–20× latency, token-counter retries). For PRs >5000 lines, `--commit`-chunk by individual commit (each ≤5K). See step 4 codex sub-section for chunking logic. |
+  | Codex (gpt-5.5 via Copilot Enterprise, `--profile copilot`) | 5000 PER CALL, 50000 PR total via per-commit chunking | Empirically codex degrades sharply >5000 lines/call (10–20× latency, token-counter retries). For PRs >5000 lines, `--commit`-chunk by individual commit (each ≤5K). See step 4 codex sub-section for chunking logic. |
   | code-reviewer-opus (Opus 4.7 1M) | 50000 | 1M context easily fits 50k-line diffs in token-budget terms (≈ 750k tokens). Beyond 50k you start seeing real attention-dilution / hallucination. |
   | pr-coherence (Opus 4.7 1M, bespoke) | 50000 | Same envelope as code-reviewer-opus. |
 
@@ -187,10 +233,10 @@ For each remaining PR:
   downstream Agent B knows the review is partial.
 
   Rationale (history): the 5000-line blanket cap dated from the 200K-
-  context era. Once Claude reviewers run on Opus 4.7 1M (or comparable
-  1M-context backend), the 5K cap is wasteful: it blocked PRs in the
-  4-15k range that the Claude reviewers handle just fine. Per-reviewer
-  caps + much higher hard skip is the right model on 1M context.
+  context era. With Copilot Enterprise + Opus 4.7 1M as the routing
+  default, that cap blocked PRs in the 4-15k range that
+  the Claude reviewers handle just fine. Per-reviewer + much higher
+  hard skip is the right model now.
 
 Process the remaining PRs **sequentially** (even though they're
 independent — interleaved review comments confuse downstream Agent B).
@@ -649,7 +695,7 @@ re-querying the API.
 
 When the user starts the daemon for the first time on a new repo:
 
-1. Check `gh auth status` and `codex --version`. If you've set `CODEX_PROFILE=<name>`, also confirm `codex --profile "$CODEX_PROFILE" --version` works.
+1. Check `gh auth status` and `codex --version`.
 2. Confirm `code-reviewer-opus` agent loads (it's user-level at
    `~/.claude/agents/code-reviewer-opus.md`).
 3. Confirm `~/.local/state/claude-pr-pipeline/<repo>/` is creatable.

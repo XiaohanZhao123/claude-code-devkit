@@ -1,6 +1,6 @@
 ---
 name: pr-orch-tick
-description: One orchestration cycle of the PR review pipeline (Agent B). Designed to be invoked by `/loop /pr-orch-tick` inside a long-running tmux daemon session, sibling to `/pr-review-tick` (Agent A). Each tick discovers PRs that have a new review comment from Agent A, spawns a fix worker sub-agent (in an isolated git worktree at `/tmp/orch-<slug>-pr<N>`) following the `pr-defense-loop` triage discipline, applies fixes with `[auto N/4]` tagged commits, and after the worker reports "no more actionable findings" runs the merge-gate verdict — either posting a "would auto-merge" dry-run comment, executing `gh pr merge`, or @-mentioning the user with a summary. Use this whenever the user says "start the orchestrator daemon", "Agent B", "kick off the orch tick", or `/loop /pr-orch-tick`. NEVER reviews PRs (that's Agent A's job). Caps at `max_rounds=4` per PR; refuses to auto-merge external contributor PRs regardless of dry-run state; respects per-PR `flock` so it never collides with Agent A.
+description: One orchestration cycle of the PR review pipeline (Agent B). Designed to be invoked by `/loop /pr-orch-tick` inside a long-running tmux daemon session, sibling to `/pr-review-tick` (Agent A). Each tick discovers opted-in PRs (those with the `[auto PR loop]` marker in title or body) that have a new review comment from Agent A, captures the current head SHA as the per-snapshot target, spawns a fix worker sub-agent in a detached-HEAD worktree pinned to that SHA (avoiding collisions with concurrent worktrees / external agents), applies fixes with `[auto N/4]` tagged commits, and pushes via `--force-with-lease` so external commits never get clobbered. After the worker reports "no more actionable findings", runs the merge-gate verdict — auto-merge if eligible, otherwise post a "fixes pushed; manual merge required" comment without freezing the PR. Use this whenever the user says "start the orchestrator daemon", "Agent B", "kick off the orch tick", or `/loop /pr-orch-tick`. NEVER reviews PRs (that's Agent A's job). Caps at `max_rounds=4` per snapshot; refuses to auto-merge external contributor PRs regardless of dry-run state; respects per-PR `flock` so it never collides with Agent A. Per-snapshot accountability: once a head SHA is acted on, the loop won't re-engage on the same SHA — but ANY new commit to the branch re-engages automatically.
 ---
 
 # PR orchestration tick — Agent B of the PR review pipeline
@@ -218,10 +218,9 @@ if not correct:
     )
 ```
 
-**`*/2`, NOT `*/5` or `*/10`.** The user expects PR fixes to land
-within minutes of Agent A's review, not within 10–15 minutes. Idle
-ticks just hit GitHub's API (sub-second, no model calls), so 5× more
-ticks costs essentially nothing in either time or backend tokens.
+**`*/2`, NOT `*/5` or `*/10`.** Copilot Enterprise quota is effectively
+unlimited so 5x more ticks costs $0. The user expects PR fixes to land
+within minutes of A's review, not within 10–15 minutes.
 
 #### Channel 2: Monitor on `notify_orch` (event-driven, ~2s latency — MANDATORY)
 
@@ -296,20 +295,85 @@ If both green, proceed to step 2.
 
 ### 2. Discover work
 
-For each open non-draft PR:
+#### 2a. Opt-in keyword filter — `[auto PR loop]` (MANDATORY, same as Agent A)
+
+> **Agent B only touches PRs the author has explicitly opted in.**
+> A PR is opted in iff its **title** OR the **first 500 characters of
+> its body** contain the case-insensitive marker `[auto PR loop]`
+> (brackets required, internal whitespace flexible). Any PR without
+> the marker MUST be skipped — even if it has a `pr-<N>/` state dir
+> from a previous opt-in cycle (the author may have removed the marker
+> as an off-switch).
+
+```python
+import re
+OPT_IN_RE = re.compile(r"\[\s*auto\s+PR\s+loop\s*\]", re.IGNORECASE)
+
+def is_opted_in(pr):
+    title = pr.get("title", "") or ""
+    body  = (pr.get("body", "") or "")[:500]
+    return bool(OPT_IN_RE.search(title) or OPT_IN_RE.search(body))
+```
+
+Pull `gh pr list --state open --json number,title,body,headRefOid,isDraft`
+once at tick start, filter to opted-in non-drafts.
+
+If empty: log and re-arm. No fix work this tick.
+
+#### 2b. Per-PR work selection (only for opted-in PRs)
+
+For each opted-in PR:
 
 ```bash
 PR_DIR="$STATE_ROOT/pr-$N"
-[[ -d "$PR_DIR" ]] || continue   # Agent A hasn't seen this PR yet
-[[ -f "$PR_DIR/escalated_at" ]] && continue   # already escalated, hands off
+[[ -d "$PR_DIR" ]] || continue   # Agent A hasn't reviewed this PR yet
 ```
 
 A PR needs orchestrator attention if:
 - `last_reviewed_sha` exists (Agent A reviewed it)
-- AND (`last_orch_round` doesn't exist OR `last_orch_round < 4`)
+- AND `last_reviewed_sha == pr.headRefOid` (the review still matches
+  the current head — if the head moved, wait for Agent A's next tick
+  to re-review the new SHA before we fix)
+- AND we haven't already finished a round on THIS SHA (see "snapshot
+  contract" below)
 - AND the most recent issue/review comment from us (the daemon's
-  GitHub identity) on this PR is OLDER than `last_reviewed_at` —
-  i.e., Agent A has posted a comment we haven't responded to yet.
+  GitHub identity) on this PR is OLDER than `last_reviewed_at`.
+
+#### 2c. Snapshot contract: per-(PR, head-sha) accountability
+
+> **Agent B's commitment scope is a single (PR, head-sha) snapshot.**
+> When we start a round, we capture `TARGET_SHA = pr.headRefOid` and
+> drive THAT snapshot toward "fix commit pushed". We are NOT
+> responsible for what happens to the branch afterwards (the author
+> may push more commits, another agent may rebase, etc.). Our
+> contract per snapshot:
+>
+>   1. Read Agent A's findings on this SHA.
+>   2. Worker fixes the (a) bucket on a worktree pinned to this SHA.
+>   3. Push the fix with `--force-with-lease=<branch>:<TARGET_SHA>`
+>      so external commits don't get clobbered.
+>   4. Either auto-merge (if verdict gate passes) OR post a "fixes
+>      pushed, manual merge required" comment.
+>   5. Stamp `last_orch_round_sha = TARGET_SHA` and stop.
+>
+> If the push fails (`--force-with-lease` rejected → branch moved):
+> drop the work, do NOT retry within this tick. Next tick Agent A
+> will re-review the new head; we'll come back fresh.
+
+Cap on this snapshot: at most `max_rounds=4` consecutive worker
+rounds on the SAME PR (across multiple SHAs in the same loop session).
+After 4 rounds with findings still actionable, post a
+"max-rounds-reached" comment and stop touching the PR **until its
+head moves to a SHA we haven't acted on**. Track via `last_escalated_sha`:
+
+```python
+last_esc = read_optional(f"{PR_DIR}/last_escalated_sha")
+if last_esc and last_esc == pr.headRefOid:
+    continue   # we already escalated on this exact SHA; wait for new commit
+```
+
+This is the replacement for the old `escalated_at` permanent freeze.
+The author can always push a new commit (or rebase) to re-engage Agent B.
 
 If no PR needs attention this tick, re-arm and exit.
 
@@ -322,20 +386,41 @@ flock -n -x 9 || { echo "[pr-orch-tick] PR #$N busy with Agent A, retry next tic
 
 ### 4. Spawn the fix worker
 
-The worker runs in an **isolated git worktree** so the daemon's tmux
-session's git state stays untouched.
+The worker runs in an **isolated git worktree pinned to TARGET_SHA via
+detached HEAD**. We deliberately do NOT `gh pr checkout` — that would
+try to claim the branch name locally, which fails if another worktree
+(elsewhere on the machine, e.g. an `omnara` session) already has it
+checked out. Detached HEAD bypasses branch-name ownership entirely.
 
 ```bash
+TARGET_SHA=$(gh pr view "$N" --json headRefOid -q .headRefOid)
+TARGET_BRANCH=$(gh pr view "$N" --json headRefName -q .headRefName)
+PR_FORK_REPO=$(gh pr view "$N" --json headRepository,headRepositoryOwner \
+                 -q '.headRepositoryOwner.login + "/" + .headRepository.name')
+
 WORKTREE=/tmp/orch-${REPO_SLUG}-pr${N}
-rm -rf "$WORKTREE"  # clean slate; the previous worker should have removed it
-git worktree add --detach "$WORKTREE"
-(
-  cd "$WORKTREE"
-  gh pr checkout "$N"   # handles fork remotes automatically
-  # The worker Agent operates here; see prompt below.
-)
+rm -rf "$WORKTREE"   # clean slate; previous worker should have removed it
+
+# Fetch the PR head SHA explicitly (handles fork remotes — `gh` already
+# made it reachable; the explicit fetch is a belt-and-suspenders for
+# the case where the worker runs in a worktree that hasn't seen the SHA
+# yet).
+git fetch origin "$TARGET_SHA" 2>/dev/null \
+  || git fetch origin "pull/$N/head:refs/remotes/origin/pr-$N-head" 2>/dev/null \
+  || true
+
+# Detached HEAD worktree — does NOT claim the branch name. Survives
+# concurrent worktrees / omnara sessions / etc.
+git worktree add --detach "$WORKTREE" "$TARGET_SHA"
+```
+
+The worker Agent operates in `$WORKTREE`. After the worker returns:
+
+```bash
 git worktree remove "$WORKTREE" --force
 ```
+
+(Cleanup happens regardless of worker success/failure — see step 9.)
 
 Spawn the worker via the `Agent` tool:
 
@@ -353,8 +438,12 @@ Agent(
 You are the fix worker for the PR review pipeline (Agent B's
 sub-agent). Your job for this round only:
 
-1. cwd is `{WORKTREE}`. The PR branch is checked out. Verify with
-   `git status` + `git log --oneline -5` before doing anything.
+1. cwd is `{WORKTREE}`. The repo is in **detached HEAD state pinned
+   to TARGET_SHA={TARGET_SHA} (PR head at tick start)**. The branch
+   `{TARGET_BRANCH}` is NOT checked out locally — that's intentional
+   (avoids collisions with concurrent worktrees / external agents).
+   Verify with: `git status` (shows "HEAD detached at <sha>") +
+   `git log --oneline -5`.
 
 2. Read these files in this order:
    - `~/.claude/skills/pr-defense-loop/SKILL.md` — the triage discipline
@@ -426,7 +515,37 @@ sub-agent). Your job for this round only:
    The `[auto {round_n}/4]` tag is REQUIRED — it's how the daemon
    recognizes its own work and how the cap is auditable.
 
-6. `git push origin <branch>`.
+6. Push your commit back to the PR's branch with **`--force-with-lease`
+   anchored to TARGET_SHA**:
+
+   ```bash
+   git push origin "HEAD:refs/heads/{TARGET_BRANCH}" \
+     --force-with-lease="{TARGET_BRANCH}:{TARGET_SHA}"
+   ```
+
+   This says "only accept my push if the remote branch is still at
+   TARGET_SHA". If somebody else (the human author, another agent)
+   pushed in the meantime, the lease is broken and our push is
+   rejected (non-zero exit code).
+
+   If the push fails because of `--force-with-lease`: the branch
+   moved. **Do NOT retry within this round.** Return with
+   `blocked: "branch moved during round; remote head is now <new-sha>
+   (was <TARGET_SHA>). Skipping; next tick will start fresh from new
+   head."` so the orchestrator can stamp state correctly and let the
+   next tick re-engage.
+
+   For fork PRs (the head repo differs from the base repo, e.g.
+   external contributors): the `--force-with-lease` push targets the
+   fork's branch via the `gh`-managed remote — `git push origin` may
+   not have access. In that case, fall back to:
+
+   ```bash
+   gh pr view {N} --json maintainerCanModify -q .maintainerCanModify
+   # if true: push works via origin's pull/<N>/head ref
+   # if false: cannot push. Return blocked with reason
+   #          "external PR; maintainerCanModify=false; cannot push fix"
+   ```
 
 7. Return a structured summary as your final message:
 
@@ -582,9 +701,47 @@ Post a confirmation comment after merge succeeds:
 Worker rounds: {last_orch_round}/4.
 ```
 
-#### 7c. `gate_pass == False`
+#### 7c. `gate_pass == False` — fixes pushed but out-of-envelope for auto-merge
 
-Escalate (step 8) with a reason listing which gate items failed.
+The worker DID push a fix commit (or returned actionable=0). The
+verdict gate says auto-merge isn't safe (huge diff, CI red, sensitive
+paths, external author, low confidence, etc.). **This is NOT
+escalation in the old "freeze the PR" sense — we did the work we
+promised, we just won't auto-merge it.**
+
+Post a single comment, stamp the SHA, and let the PR sit:
+
+```markdown
+## PR review pipeline — Agent B verdict @ <HEAD_SHA short>
+
+**Fixes pushed; not auto-merging.** Per-snapshot contract honored —
+Agent A's findings on `<HEAD_SHA>` triaged + fixable ones committed
+as `[auto N/4]`. This PR is outside the auto-merge envelope:
+
+- {list which gate items failed, ✓ for passing ones}
+
+Manual merge / further iteration is up to you. If you push a new
+commit to this branch, the loop will re-engage on the new SHA
+automatically (no need to remove or re-add `[auto PR loop]`).
+
+Round history this snapshot: <N>/4.
+```
+
+```bash
+echo "$HEAD_SHA" > "$PR_DIR/last_orch_round_sha"   # we acted on this SHA
+# Do NOT write last_escalated_sha — that's only for max_rounds_reached.
+```
+
+**Why no escalation freeze**: in the new opt-in model, the human
+explicitly opted in via `[auto PR loop]` and is responsible for
+deciding when the PR is done. We've done our part on this SHA. The
+loop naturally re-engages when head moves.
+
+#### 7d. `last_orch_round >= 4` AND worker still finds actionable
+
+Hit the per-snapshot round cap. Post the escalation comment (step 8)
+AND stamp `last_escalated_sha = HEAD_SHA`. Next tick checks that file
+and silently skips while head stays at that SHA. New commit → re-engage.
 
 ### 8. Escalation
 
