@@ -131,8 +131,10 @@ Shares the per-repo state directory with Agent A:
       last_orch_round           # this skill writes: 0..4
       last_orch_action_at       # ISO timestamp of last commit/push by worker
       consecutive_no_actionable # this skill writes: 0..2
-      escalated_at              # ISO timestamp; if set, this skill stops touching the PR until cleared
+      last_orch_round_sha       # SHA we last successfully acted on (worker pushed OR no actionable findings)
+      last_escalated_sha        # SHA we hit max_rounds on; loop skips this exact SHA, re-engages on new commits
       verdict_log.jsonl         # one record per verdict gate evaluation
+      # DEPRECATED: escalated_at — replaced by last_escalated_sha. Old SKILL revisions wrote this; new SKILL ignores it.
     dry_run                     # repo-scoped flag file; presence = dry-run mode
 ```
 
@@ -178,7 +180,7 @@ design.
 > forget", not "if convenient". Every tick verifies both, repairs any
 > that died.
 >
-> Past observation: daemons that skipped this step ended
+> Past observation (2026-05-10): daemons that skipped this step ended
 > up with 10-minute cron + no Monitor at all, missing every fast A→B
 > handoff. The user had to manually intervene to fix the cadence after
 > noticing the staleness. Don't be that daemon.
@@ -230,7 +232,7 @@ stdout line per change → arrives as a notification → daemon wakes for
 an immediate tick.
 
 > **CRITICAL: `Monitor` is a deferred tool.** Past observation
->: daemons claimed "no Monitor tool available in this
+> (2026-05-10): daemons claimed "no Monitor tool available in this
 > harness" and skipped Channel 2 entirely. The fix is to call
 > `ToolSearch(query="select:Monitor")` first to load Monitor's
 > schema into this session — only after that can `Monitor()` be
@@ -386,10 +388,34 @@ flock -n -x 9 || { echo "[pr-orch-tick] PR #$N busy with Agent A, retry next tic
 
 ### 4. Spawn the fix worker
 
+> **MANDATORY: spawn the worker. DO NOT pre-flight-bailout.**
+>
+> If we reached this step (passed steps 1.5/2a/2b/2c/3) the contract is:
+> opted-in PR + new findings + we haven't acted on THIS SHA yet. **The
+> worker MUST run.** Forbidden rationalizations for skipping the worker:
+>
+> - "the diff is too big to auto-merge anyway" → wrong; that's a verdict-
+>   gate concern (step 7) AFTER fixes are pushed; the human author asked
+>   for the fix work by opting in, and `[auto N/4]` commits on a too-big
+>   PR are still valuable (they reduce the human's review surface even
+>   if they have to merge by hand).
+> - "the PR has merge conflicts with main" → wrong; the worker doesn't
+>   resolve PR↔main conflicts (that's the author's call), but it CAN and
+>   MUST address the findings on the current head. Conflicts with main
+>   are orthogonal to fixing the snapshot's own bugs.
+> - "the branch is checked out elsewhere" → wrong; we use detached
+>   HEAD (see below), branch claim doesn't matter.
+> - "I think the user would prefer manual review" → not your call; opt-in
+>   is consent. Honor it.
+>
+> The ONLY legal pre-worker bailouts: missing opt-in marker (handled at
+> step 2a), no new findings (handled at step 2b), `last_escalated_sha
+> == TARGET_SHA` (we already maxed out on this exact SHA — step 2c).
+
 The worker runs in an **isolated git worktree pinned to TARGET_SHA via
 detached HEAD**. We deliberately do NOT `gh pr checkout` — that would
 try to claim the branch name locally, which fails if another worktree
-(elsewhere on the machine, e.g. an `omnara` session) already has it
+(elsewhere on the machine, e.g. another agent session) already has it
 checked out. Detached HEAD bypasses branch-name ownership entirely.
 
 ```bash
@@ -771,17 +797,21 @@ Post a PR comment with `@{user}` mention:
 
 When you've decided, either:
 - Merge manually if you accept the risk Agent B flagged.
-- Push a fix and `rm {PR_DIR}/escalated_at` to re-engage Agent B.
+- Push a new commit — Agent B will automatically re-engage on the new
+  head SHA (no manual state-file cleanup needed).
 - Close the PR.
 ```
 
 ```bash
-date -Iseconds > "$PR_DIR/escalated_at"
+echo "$HEAD_SHA" > "$PR_DIR/last_escalated_sha"
 ```
 
-The `escalated_at` flag stops Agent B from touching the PR until the
-user clears it. Agent A keeps reviewing new pushes (which is fine —
-the user can use those to decide).
+The `last_escalated_sha` stamp tells Agent B: "we already gave up on
+THIS exact SHA". If the head moves (author pushes), the file's value
+no longer matches and Agent B re-engages naturally. **Do NOT write
+`escalated_at`** — that was the old permanent-freeze marker; it's
+deprecated. If you see a stale `escalated_at` file from a pre-2026-
+SKILL-revision daemon, ignore it (don't read it, don't write it).
 
 ### 9. Cleanup and re-arm
 
