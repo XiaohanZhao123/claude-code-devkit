@@ -27,6 +27,53 @@ actual code," stop — that's a fix-worker concern (the worker triages
 into (a) worth fixing / (b) wrong analysis / (c) not worth), not an
 orchestrator concern.
 
+## Anti-improvisation principle
+
+This SKILL is iteratively hardened against daemon improvisation.
+Past observation: when this SKILL didn't explicitly cover some
+corner of a problem, Opus xhigh's reasoning has repeatedly filled
+the gap by **inventing its own mechanism** — and those inventions
+have consistently failed cleanup, leaving the pipeline in stuck
+states the operator has to manually unjam.
+
+**When you hit a situation the SKILL doesn't obviously cover, the
+answer is NEVER:**
+
+- Inventing your own state-file name not in the documented list
+- Using fd numbers other than what's documented (fd 9 for flock)
+- Spawning background processes (`sleep N &`, `disown`, `nohup`)
+  for state management
+- Writing event types or fields to `verdict_log.jsonl` that aren't
+  documented
+- Reading `verdict_log.jsonl` as a state-recovery source on restart
+  (it's human audit only)
+- Bumping `last_reviewed_sha` / `last_reviewed_at` without actually
+  running a fresh review (Agent A-side concern; mirrored here for
+  reference)
+
+**The answer IS:**
+
+- Do the minimal thing this SKILL DOES say
+- If genuinely stuck, post a `gh pr comment` naming the gap and stop
+- Let the operator update the SKILL on observation
+
+**Anti-pattern catalogue (past incidents — don't repeat):**
+
+| Improvisation | Why daemon thought it was clever | Why it broke |
+|---|---|---|
+| `escalated_at` permanent freeze | "We already gave up, mark it" | Deprecated; replaced by per-SHA `last_escalated_sha` |
+| Mining `verdict_log.jsonl` for past escalation events | "Consistent with history" | Old log entries from pre-rewrite SKILL poisoned new ticks |
+| `sleep 7200 &` + `fd 200` to hold flock cross-tick | "Keep A out while worker fixes" | Orphan sleep held lock 2h after orch tick exited |
+| Same-SHA `last_reviewed_sha` rebump without re-review | "SHA unchanged, log it as still reviewed" | Wrote partial state without findings → Agent B saw "reviewed but nothing to fix" |
+| Pre-flight bailout on "diff too big to merge" | "Save worker compute" | Worker MUST run for opted-in PRs; auto-merge is decided POST-fix |
+
+**Enforcement layer**: `~/.claude/hooks/block-pipeline-improvisations.sh`
+(PreToolUse / Bash) deterministically blocks the specific bash
+patterns those improvisations need. The hook is reactive (covers
+patterns we've seen) — new improvisations will create new incidents
+and new hook entries. If a hook blocks you, READ the hook's stderr
+to see which SKILL rule you violated and follow it.
+
 ## Orchestrator role: read-only contract
 
 The orchestrator (this skill, running as the top-level Claude in the
@@ -408,10 +455,31 @@ If no PR needs attention this tick, re-arm and exit.
 
 ### 3. Acquire the per-PR lock
 
+**Use EXACTLY this pattern. No improvisation.**
+
 ```bash
 exec 9>"$PR_DIR/lock"
 flock -n -x 9 || { echo "[pr-orch-tick] PR #$N busy with Agent A, retry next tick"; continue; }
 ```
+
+Constraints (enforced both by SKILL prose AND by
+`~/.claude/hooks/block-pipeline-improvisations.sh`):
+
+- fd MUST be `9`. Not `200`, not `100`, not `300`. The hook blocks
+  any `exec [3-9][0-9]+>` redirecting to a pipeline state file.
+- Lock auto-releases when **this tick exits** — that's by design.
+- Do NOT spawn `sleep N &` / `disown` / `nohup` / any process trick
+  to hold the lock cross-tick. The hook blocks `sleep [0-9]{3,}.*&`
+  in commands touching pipeline state.
+- If you think you "need" cross-tick holding (e.g. to keep Agent A
+  out during the worker run): you don't. flock just prevents
+  simultaneous A+B on the SAME PR within ONE tick boundary. The
+  worker is invoked via `Agent` tool inside this tick, and the tick
+  doesn't release until the Agent returns. Cross-tick coordination
+  comes from disk state files, not flock.
+
+If you hit a flock situation the SKILL doesn't cover, log it via
+`gh pr comment` (visible to the user) and stop — DO NOT improvise.
 
 ### 4. Spawn the fix worker
 
