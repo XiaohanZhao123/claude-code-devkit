@@ -128,30 +128,57 @@ Shares the per-repo state directory with Agent A:
       author_association        # Agent A writes; Agent B reads
       last_findings.jsonl       # Agent A writes; Agent B reads
 
-      last_orch_round           # this skill writes: 0..4
+      last_orch_round           # this skill writes: 0..max_rounds
       last_orch_action_at       # ISO timestamp of last commit/push by worker
       consecutive_no_actionable # this skill writes: 0..2
-      last_orch_round_sha       # SHA we last successfully acted on (worker pushed OR no actionable findings)
-      last_escalated_sha        # SHA we hit max_rounds on; loop skips this exact SHA, re-engages on new commits
+      last_orch_round_sha       # SHA we last completed a round on (worker pushed OR no actionable findings OR verdict-fail commented)
+      last_escalated_sha        # SHA we hit max_rounds on; loop skips this exact SHA, re-engages when head moves
       verdict_log.jsonl         # one record per verdict gate evaluation
-      # DEPRECATED: escalated_at — replaced by last_escalated_sha. Old SKILL revisions wrote this; new SKILL ignores it.
     dry_run                     # repo-scoped flag file; presence = dry-run mode
 ```
 
+**State files Agent B writes — exhaustive list.** Only these. If you find
+yourself reaching for a different state-file name (especially
+`escalated_at` from older SKILL revisions): STOP. That field is gone.
+Use `last_escalated_sha` (per-SHA, auto-invalidates on new commits)
+or `last_orch_round_sha` (per-SHA round bookkeeping).
+
 The `dry_run` flag file is at the **repo level**, not per-PR. New repos
-should have it created on daemon startup; user `rm`s it after ~7 days
-of observed sane verdicts to flip to real-merge mode.
+should have it created on daemon startup; user `rm`s it after observed
+sane verdicts to flip to real-merge mode.
+
+## Operating regime: aggressive fix, conservative merge
+
+This pipeline runs in a regime where **per-tick compute is effectively
+free** (the daemon's backend has high quota). The design implication:
+
+- **Don't ever pre-flight-bailout on "this PR seems hard"** (diff too big,
+  merge conflict with main, lots of files). Aggressively fixing is cheap;
+  if it produces useful commits the human author benefits even if the
+  PR ultimately gets merged by hand. The opt-in marker is consent; honor it.
+- **Don't ever skip a worker round to "save compute."** Compute is not the
+  bottleneck. Quality is.
+- **Auto-merge is conservative** — even in the unlimited-compute regime,
+  shipping bad code to main is the real failure mode. The verdict gate
+  still gates on correctness signals (CI green, codex finds no [P0],
+  worker confidence, internal author), but NOT on heuristics that exist
+  to "save compute" or "avoid wasting a round" (diff size caps, path
+  blacklists). Those got removed — they were Era-1 budget proxies, not
+  quality signals.
 
 ## The hard cap: max_rounds = 4
 
-After 4 rounds of fix-and-push on the same PR, **stop**. Don't run a 5th.
-Either:
-- The worker has been chasing false positives (check `verdict_log.jsonl`
-  for a pattern of low-confidence rounds) → escalate to user with the
-  triage history.
-- The worker is making real progress but the PR is genuinely complex
-  → escalate; Agent B is not designed to ship arbitrarily-complex
-  refactors autonomously.
+After 4 rounds of fix-and-push on the same PR with findings still
+actionable, **stop**. Don't run a 5th. The reason this cap exists is
+**structural sanity, not budget**: if 4 rounds of Opus+codex review +
+fix didn't close findings, what we're hitting is one of:
+- The worker is chasing false positives that Agent A's reviewers keep
+  re-flagging (a structural review-loop bug)
+- The PR has an architectural issue that the local fix worker can't
+  resolve without out-of-scope changes
+- A genuinely complex change Agent B isn't designed to ship autonomously
+
+All three are operator-escalation cases.
 
 `last_orch_round` is the canonical counter. Worker commit messages
 embed `[auto N/4]` so the cap is auditable from `git log` alone.
@@ -180,7 +207,7 @@ design.
 > forget", not "if convenient". Every tick verifies both, repairs any
 > that died.
 >
-> Past observation (2026-05-10): daemons that skipped this step ended
+> Past observation: daemons that skipped this step ended
 > up with 10-minute cron + no Monitor at all, missing every fast A→B
 > handoff. The user had to manually intervene to fix the cadence after
 > noticing the staleness. Don't be that daemon.
@@ -232,7 +259,7 @@ stdout line per change → arrives as a notification → daemon wakes for
 an immediate tick.
 
 > **CRITICAL: `Monitor` is a deferred tool.** Past observation
-> (2026-05-10): daemons claimed "no Monitor tool available in this
+>: daemons claimed "no Monitor tool available in this
 > harness" and skipped Channel 2 entirely. The fix is to call
 > `ToolSearch(query="select:Monitor")` first to load Monitor's
 > schema into this session — only after that can `Monitor()` be
@@ -388,29 +415,16 @@ flock -n -x 9 || { echo "[pr-orch-tick] PR #$N busy with Agent A, retry next tic
 
 ### 4. Spawn the fix worker
 
-> **MANDATORY: spawn the worker. DO NOT pre-flight-bailout.**
->
-> If we reached this step (passed steps 1.5/2a/2b/2c/3) the contract is:
-> opted-in PR + new findings + we haven't acted on THIS SHA yet. **The
-> worker MUST run.** Forbidden rationalizations for skipping the worker:
->
-> - "the diff is too big to auto-merge anyway" → wrong; that's a verdict-
->   gate concern (step 7) AFTER fixes are pushed; the human author asked
->   for the fix work by opting in, and `[auto N/4]` commits on a too-big
->   PR are still valuable (they reduce the human's review surface even
->   if they have to merge by hand).
-> - "the PR has merge conflicts with main" → wrong; the worker doesn't
->   resolve PR↔main conflicts (that's the author's call), but it CAN and
->   MUST address the findings on the current head. Conflicts with main
->   are orthogonal to fixing the snapshot's own bugs.
-> - "the branch is checked out elsewhere" → wrong; we use detached
->   HEAD (see below), branch claim doesn't matter.
-> - "I think the user would prefer manual review" → not your call; opt-in
->   is consent. Honor it.
->
-> The ONLY legal pre-worker bailouts: missing opt-in marker (handled at
-> step 2a), no new findings (handled at step 2b), `last_escalated_sha
-> == TARGET_SHA` (we already maxed out on this exact SHA — step 2c).
+By the time we reach this step we passed steps 1.5/2a/2b/2c/3, so the
+contract holds: opted-in PR + new findings + we haven't completed a
+round on THIS SHA yet. **Spawn the worker — there is no further
+pre-worker filter.** Compute is not the bottleneck; the worker runs.
+
+The verdict gate (step 7) runs AFTER the worker finishes, never as a
+look-ahead. If the gate ultimately won't pass (e.g. CI red), that's
+handled by step 7c (post a "manual-merge note") — that's still useful
+work because the worker's fix commit lands on the branch regardless
+of whether auto-merge can happen.
 
 The worker runs in an **isolated git worktree pinned to TARGET_SHA via
 detached HEAD**. We deliberately do NOT `gh pr checkout` — that would
@@ -648,40 +662,42 @@ echo 0 > "$PR_DIR/consecutive_no_actionable"
 | Worker pushed a fix this round | Release lock, re-arm; Agent A will review the new SHA next tick, then come back |
 | Worker returned `blocked` | **Escalate** (step 8) with the worker's reason |
 
-### 7. Verdict gate
+### 7. Verdict gate (auto-merge decision only)
 
-Compute the gate. ALL of the following must be true to be eligible
-for auto-merge:
+> **The verdict gate decides ONE question: do we `gh pr merge` now, or
+> not?** It does NOT decide whether to run the worker — that decision
+> was made upstream by the opt-in marker. By the time we reach step 7,
+> the worker has already run (step 4) and pushed a fix (or returned
+> with no actionable findings). This is purely "is auto-merge safe?".
+
+The gate is intentionally small. Only correctness/security signals.
+No "this seems too big for me to feel comfortable" heuristics — those
+were Era-1 budget proxies (when worker compute was scarce we used
+diff size to gate which PRs got fixed); they don't belong in a quality
+gate.
 
 ```python
 ci_green = all(
     check["conclusion"] == "success"
     for check in gh_api(f"repos/{OWNER}/{REPO}/commits/{HEAD_SHA}/check-runs")["check_runs"]
-)
-diff_ok = (lines_changed < 200 and files_changed < 5)
-paths_ok = not any(
-    re.match(r"^(\.github/|migrations/|.*\.lock|secrets/|auth/|crypto/|config/)", p)
-    for p in changed_paths
-)
-no_test_deletions = no diff hunks remove lines from test files
-confidence_ok = worker_self_confidence >= 0.85
+) or (no checks configured for this repo)  # repos w/o CI: gate trivially passes this leg
 codex_clean = the most recent codex review on this PR (from Agent A's
               last_findings.jsonl) reports zero [P0] findings
+confidence_ok = worker_self_confidence >= 0.85
 internal_author = author_association in ("OWNER", "MEMBER", "COLLABORATOR")
+
+gate_pass = ci_green AND codex_clean AND confidence_ok AND internal_author
 ```
 
 Note `internal_author` is REQUIRED for auto-merge. External
-contributor PRs ALWAYS escalate to the user, regardless of dry-run
-state. This is non-negotiable per the pipeline design.
-
-`gate_pass = ci_green AND diff_ok AND paths_ok AND no_test_deletions
-             AND confidence_ok AND codex_clean AND internal_author`
+contributor PRs ALWAYS go to the manual-merge path, regardless of
+dry-run state.
 
 Three branches:
 
 #### 7a. `gate_pass == True` AND `dry_run` flag file present
 
-Post a comment on the PR (do NOT merge):
+Post a "would auto-merge" comment (no actual merge):
 
 ```markdown
 ## PR review pipeline — Agent B verdict @ <HEAD_SHA short>
@@ -690,22 +706,19 @@ Post a comment on the PR (do NOT merge):
 
 Gate: PASS
 - CI: ✓ all checks green
-- Diff size: ✓ <lines> lines, <files> files
-- Path safety: ✓ no security/migration/config changes
-- Test deletions: ✓ none
-- Worker confidence: ✓ <conf>
 - codex: ✓ no [P0]
+- Worker confidence: ✓ <conf>
 - Author: ✓ internal
 
 cc @{user} — when you're ready to flip out of dry-run mode for this
 repo, `rm ~/.local/state/claude-pr-pipeline/{REPO_SLUG}/dry_run`.
 
-Worker rounds: {last_orch_round}/4. Total commits this loop: {N}.
+Worker rounds this snapshot: {last_orch_round}.
 ```
 
-Write to `verdict_log.jsonl`. Don't escalate further (the comment IS
-the escalation, and the user opted into dry-run for exactly this
-reason).
+```bash
+echo "$HEAD_SHA" > "$PR_DIR/last_orch_round_sha"
+```
 
 #### 7b. `gate_pass == True` AND no `dry_run` flag file
 
@@ -722,71 +735,82 @@ Post a confirmation comment after merge succeeds:
 
 **Auto-merged.** Gate PASS.
 
-[same gate breakdown as 7a]
+- CI: ✓ all checks green
+- codex: ✓ no [P0]
+- Worker confidence: ✓ <conf>
+- Author: ✓ internal
 
-Worker rounds: {last_orch_round}/4.
-```
-
-#### 7c. `gate_pass == False` — fixes pushed but out-of-envelope for auto-merge
-
-The worker DID push a fix commit (or returned actionable=0). The
-verdict gate says auto-merge isn't safe (huge diff, CI red, sensitive
-paths, external author, low confidence, etc.). **This is NOT
-escalation in the old "freeze the PR" sense — we did the work we
-promised, we just won't auto-merge it.**
-
-Post a single comment, stamp the SHA, and let the PR sit:
-
-```markdown
-## PR review pipeline — Agent B verdict @ <HEAD_SHA short>
-
-**Fixes pushed; not auto-merging.** Per-snapshot contract honored —
-Agent A's findings on `<HEAD_SHA>` triaged + fixable ones committed
-as `[auto N/4]`. This PR is outside the auto-merge envelope:
-
-- {list which gate items failed, ✓ for passing ones}
-
-Manual merge / further iteration is up to you. If you push a new
-commit to this branch, the loop will re-engage on the new SHA
-automatically (no need to remove or re-add `[auto PR loop]`).
-
-Round history this snapshot: <N>/4.
+Worker rounds this snapshot: {last_orch_round}.
 ```
 
 ```bash
-echo "$HEAD_SHA" > "$PR_DIR/last_orch_round_sha"   # we acted on this SHA
-# Do NOT write last_escalated_sha — that's only for max_rounds_reached.
+echo "$HEAD_SHA" > "$PR_DIR/last_orch_round_sha"
 ```
 
-**Why no escalation freeze**: in the new opt-in model, the human
-explicitly opted in via `[auto PR loop]` and is responsible for
-deciding when the PR is done. We've done our part on this SHA. The
-loop naturally re-engages when head moves.
+#### 7c. `gate_pass == False` — fixes are pushed, auto-merge waits
 
-#### 7d. `last_orch_round >= 4` AND worker still finds actionable
+**This is NORMAL, not failure.** The worker did the work it promised.
+Auto-merge just needs something we don't have yet (typically CI still
+running, or codex still has a [P0], or worker confidence below threshold).
 
-Hit the per-snapshot round cap. Post the escalation comment (step 8)
-AND stamp `last_escalated_sha = HEAD_SHA`. Next tick checks that file
-and silently skips while head stays at that SHA. New commit → re-engage.
+Post a "manual-merge note" comment — neutral, informational, NOT an
+escalation:
+
+```markdown
+## PR review pipeline — Agent B note @ <HEAD_SHA short>
+
+Worker round {last_orch_round} done. Fix commit `[auto {N}/{max_rounds}]`
+pushed. **Auto-merge waiting on:**
+
+{checklist with ✗ for failing items, ✓ for passing}
+- CI: {✓ all green / ✗ <which check failed> / ⏳ still running}
+- codex [P0]: {✓ none / ✗ N findings still flagged}
+- Worker confidence: {✓ <conf>≥0.85 / ✗ <conf><0.85}
+- Author internal: {✓ <OWNER/MEMBER/COLLABORATOR> / ✗ external — auto-merge disabled for external authors}
+
+If you push another commit to this branch, the loop re-engages on the
+new head SHA automatically. If you want to merge by hand, go ahead.
+```
+
+```bash
+echo "$HEAD_SHA" > "$PR_DIR/last_orch_round_sha"
+```
+
+The loop re-engages naturally when head moves. **No `last_escalated_sha`
+stamp here** — this isn't escalation; the human's action (push or
+merge) is the expected resolution path.
+
+#### 7d. `last_orch_round >= max_rounds` AND worker still finds actionable
+
+Hit the per-snapshot round cap. THIS is escalation (step 8). Stamp
+`last_escalated_sha = HEAD_SHA`. Next tick checks that file and
+silently skips while head stays at that SHA. New commit → re-engage.
 
 ### 8. Escalation
+
+> **Escalation is rare.** It fires ONLY from two paths:
+> - Step 7d: hit `max_rounds=4` on the same snapshot with findings still actionable
+> - Step 5: worker returned `blocked: <reason>`
+>
+> Verdict-gate failure (CI red, codex P0, low confidence) is NOT
+> escalation — that's step 7c "manual-merge note". The distinction
+> matters: 7c says "we did our job, waiting on something natural";
+> 8 says "something is structurally wrong, human needs to intervene."
 
 Post a PR comment with `@{user}` mention:
 
 ```markdown
 ## PR review pipeline — Agent B escalation @ <HEAD_SHA short>
 
-@{user} — this PR needs your judgment. Agent B will not auto-merge.
+@{user} — this snapshot is stuck. Agent B reached its structural limit.
 
-**Reason:** {gate_reason}
+**Reason:** {gate_reason — one of: "max_rounds reached on this SHA",
+"worker returned blocked: <verbatim>"}
 
-**Gate breakdown:**
+**Gate snapshot at escalation time:**
 - CI: {✓/✗} {detail if failed}
-- Diff size: {✓/✗} <lines> lines, <files> files
-- Path safety: {✓/✗} {paths matched if failed}
-- Test deletions: {✓/✗} {deleted tests if any}
-- Worker confidence: <conf> (threshold 0.85)
 - codex: {✓/✗ N [P0] findings remaining}
+- Worker confidence: {<conf> (threshold 0.85)}
 - Author: {OWNER/MEMBER/COLLABORATOR/CONTRIBUTOR/...}
 
 **Round history:**
